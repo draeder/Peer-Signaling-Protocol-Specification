@@ -3,6 +3,7 @@
 **Version:** 1.0
 **Status:** Draft
 **Scope:** Peer-to-peer signaling and discovery for WebRTC-based meshes, partial meshes, relay-assisted meshes, and hybrid decentralized overlays.
+**Revision:** 2 (additive; envelopes remain `psp_version` `"1.0"`). Revision 2 adds mesh-carried signaling (19.4), relay on demand (19.5), anchors (19.6), peer channel control frames (19.7) and relay federation (19.8). A peer that implements none of them remains conforming.
 
 ## 1. Purpose
 
@@ -263,7 +264,8 @@ Used by a peer to advertise presence and capabilities.
 
 ### Rules
 
-* Peers SHOULD periodically re-announce before `ttl_ms` expiry.
+* Peers SHOULD periodically re-announce before `ttl_ms` expiry, while they hold a relay connection (see 19.5: a peer that has released its relay connection does not re-announce).
+* A relay SHOULD NOT rewrite a registration that still has at least half of its `ttl_ms` remaining; it SHOULD extend the lease only when half or more of it has elapsed.
 * Consumers MUST treat expired announcements as stale.
 * Relays MAY cache and rebroadcast live announcements within the TTL window.
 * `announce` SHOULD be idempotent.
@@ -764,6 +766,8 @@ Graceful session termination.
 
 Optional acknowledgment for transports that do not guarantee delivery.
 
+An `ack` confirms delivery of one message on one signaling transport. It is not a liveness signal for peers that are connected to each other: the liveness of an established WebRTC edge MUST be judged on that edge (see 19.7), never on relay acknowledgements. A peer that has released its relay connection on purpose (19.5) receives none and MUST NOT treat their absence as a fault.
+
 ```json
 {
   "psp_version": "1.0",
@@ -972,6 +976,88 @@ Relays SHOULD:
 * avoid duplicating identical messages excessively
 * not assume trust
 
+### 19.4 Mesh-Carried Signaling
+
+A relay is for meeting the mesh. Once two peers are connected, signaling for a third peer, and for the pair itself, can travel on the connections they already have.
+
+A peer that holds an established data channel to a neighbour MAY carry a signaling envelope over that channel instead of the relay.
+
+* Eligible types are the negotiation messages: `connect_request`, `connect_accept`, `connect_reject`, `offer`, `answer`, `ice_candidate`, `ice_end`, `renegotiate`, and `bye`. Discovery messages and control messages (`announce`, `withdraw`, `discover`, `peer_list`, `ping`, `pong`, `ack`) address a relay and are not carried this way.
+* A sender SHOULD try the mesh first for an eligible message addressed to one peer, and use the relay only when the mesh cannot carry it. A sender MAY send on both while the addressee has not yet answered over the mesh, and SHOULD stop sending the relay copy after the first mesh-carried message from that peer.
+* The envelope is carried unmodified, as the `envelope` member of a peer channel control frame (19.7):
+
+```json
+{ "type": "~signal", "envelope": { "psp_version": "1.0", "type": "offer", "network": "example-main", "from": "peer-a", "to": "peer-b", "session_id": "room-1", "message_id": "msg-021", "timestamp": 1775030440000, "ttl_ms": 30000, "body": {} } }
+```
+
+* The receiver MUST apply the same checks as for an envelope delivered by a relay: addressed to this peer, same `network`, same `session_id`, and `from` is not this peer. Anything else MUST be dropped.
+* When the frame arrives on a channel and no forwarding is in use, `from` MUST equal the peer on the other end of that channel. A peer MAY forward a frame for another peer only without changing the envelope, with a bounded hop count, and with deduplication by `(from, message_id)`; because forwarders are untrusted, signing (18.1) is RECOMMENDED when forwarding is used.
+* A mesh-carried frame MUST NOT, by itself, cause a released relay connection to be reopened (19.5).
+
+### 19.5 Relay On Demand
+
+A peer with a healthy mesh does not need a relay connection, and holding one costs the relay work on every re-announcement and acknowledgement. A peer that can carry signaling over the mesh (19.4) MAY release its relay connection while the mesh is healthy, and MUST reopen it when it needs one. A peer that cannot carry signaling over the mesh MUST keep its relay connection.
+
+A **neighbour** is a peer with an open data channel whose liveness has been confirmed within the keepalive window (19.7).
+
+A peer SHOULD release when all of these have held continuously for the settle period (default 30 s):
+
+1. it has at least `min_mesh_peers` neighbours (default 2);
+2. it is not an anchor (19.6);
+3. no negotiation is in flight, because the answer to one may still be coming by relay.
+
+To release, a peer:
+
+1. sends `withdraw` with `body.reason` set to `relay_idle`;
+2. closes the signaling connection with a normal closure;
+3. keeps every data channel open, and does not reconnect the signaling connection while the conditions above hold.
+
+A relay that receives `withdraw` with reason `relay_idle` SHOULD drop the registration at once. Other peers learn of the peer through the mesh, not through the relay, and MUST NOT treat the withdrawal as the peer leaving the mesh. The closing of a signaling connection that was released on purpose MUST NOT tear down data channels, start recovery, or rotate to another relay.
+
+A released peer MUST reopen the relay connection and announce again when:
+
+* it has fewer than `min_mesh_peers` neighbours;
+* it must signal a peer the mesh cannot reach, which includes the first message of a new negotiation;
+* it needs discovery (`discover`) or an application asks it to;
+* it has become an anchor.
+
+After reopening, a peer SHOULD stay connected for at least the linger period (default 60 s) before releasing again. A message that caused the reopening need not be queued if the sender retries as in section 17.
+
+A host that enforces a relay acknowledgement deadline MUST suspend it while the connection is released on purpose.
+
+### 19.6 Anchors
+
+If every peer in a room released its relay connection, a newcomer would find nobody. A few peers therefore stay registered: the **anchors**.
+
+* The anchors of a room are the `anchors` peers (default 3) with the smallest distance to the room.
+* The distance of a peer is `SHA-256(peer_id) XOR SHA-256(network + ":" + session_id)`, each digest read as a 256-bit unsigned big-endian integer and each input encoded as UTF-8. Ties are broken by lexicographic order of `peer_id`.
+* A peer computes the anchors among itself, its neighbours, and the peers its neighbours have vouched for (19.7). It is an anchor when it is among them. Peers with the same view reach the same answer, and a peer closer to the room than the others it knows of learns of it through its neighbours.
+* A peer that is not an anchor but has fewer than `min_mesh_peers` neighbours keeps its relay connection, so a small or damaged mesh is never left without one.
+* Anchors are an availability measure, not an authority: a neighbour that lies about who is close can make a peer release early or hold on too long. A peer recovers from the first because its own neighbour count falling below `min_mesh_peers` reopens the relay.
+
+### 19.7 Peer Channel Control Frames
+
+A data channel between peers can carry control frames that belong to this protocol rather than to the application. A control frame is a JSON object whose `type` begins with `~`. Frame types that begin with `~` are reserved: an implementation MUST NOT deliver them to the application, and MUST ignore any it does not recognise.
+
+Defined frames:
+
+* `~signal` carries an envelope (19.4).
+* `~anchors` tells a neighbour which peers the sender vouches for:
+
+```json
+{ "type": "~anchors", "ids": ["peer-a", "peer-c", "peer-d"] }
+```
+
+* The sender vouches for itself and for its own live neighbours only, never for a peer it has merely heard of. A peer that disappeared therefore stops being repeated as soon as the last peer connected to it notices, and no stale peer can keep itself alive by being passed around.
+* A sender SHOULD send the frame when its set changes, and otherwise at least every half of the gossip TTL (default 20 s).
+* A receiver keeps the set for the gossip TTL and then discards it. It MUST accept at most 16 ids of at most 256 characters each, and MUST NOT forward the frame.
+
+Liveness of an edge is the peers' own concern and is confirmed on the channel, for example by `ping` and `pong` sent as data channel messages, not through a relay.
+
+### 19.8 Relay Federation
+
+No relay is required to be a hub. A relay MAY be configured with one or more seed relays; a relay joins the overlay through one seed at a time and learns the others from it, so any relay can be a seed. A relay MAY forward an addressed message toward the relay that holds the addressee. A relay that does not hold the addressee MUST say so with an `error` whose code is `unknown_peer` rather than drop the message silently, and a relay MUST NOT forward a message again once it has been forwarded, so that a forwarded message cannot loop.
+
 ---
 
 ## 20. Capability Negotiation
@@ -988,6 +1074,8 @@ Common capability keys:
 * `can_relay_signal`
 * `can_forward_data`
 * `can_act_bootstrap`
+* `mesh_signal` (the peer can carry negotiation messages over data channels, 19.4)
+* `relay_on_demand` (the peer may release its relay connection, 19.5)
 * `supports_signed_messages`
 * `encoding`
 
@@ -1071,6 +1159,7 @@ A full implementation SHOULD support:
 * re-announcement and expiry
 * topology hints
 * redirect and alternate peer suggestions
+* mesh-carried signaling (19.4), relay on demand with anchors (19.5, 19.6) and peer channel control frames (19.7)
 
 ---
 
@@ -1178,6 +1267,13 @@ Either side sends `bye`.
 * provide deterministic glare handling
 * process offer/answer/candidate messages correctly
 
+A peer that releases its relay connection (19.5) MUST also:
+
+* be able to carry negotiation messages over the mesh and accept them (19.4)
+* keep its data channels open across the release, and not recover or rotate relays because of it
+* reopen the relay connection in each case 19.5 lists
+* ignore `~`-prefixed control frames it does not recognise, and never deliver them to the application (19.7)
+
 ### SHOULD
 
 * support announcements with TTL
@@ -1203,6 +1299,9 @@ Either side sends `bye`.
 * retry base delay: `1000`
 * max retries: `5`
 * peer discovery limit default: `16`
+* relay on demand: `min_mesh_peers` `2`, `anchors` `3`, settle `30000`, linger `60000`
+* anchor evaluation interval: `5000`
+* anchor gossip TTL: `20000`
 
 ---
 
@@ -1222,6 +1321,9 @@ Either side sends `bye`.
 
 5. **Keep signaling separate from app messaging.**
    Once WebRTC is up, app traffic should move off the signaling substrate if possible.
+
+6. **Keep the relay out of an established mesh.**
+   Re-announcements, acknowledgements and liveness checks against a relay are costs that a healthy mesh does not need. Carry negotiation over the mesh (19.4), judge edges on the edge, and release the relay connection when the mesh can stand without it (19.5).
 
 ---
 
