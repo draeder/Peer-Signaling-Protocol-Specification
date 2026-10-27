@@ -3,7 +3,18 @@
 **Version:** 1.0
 **Status:** Draft
 **Scope:** Peer-to-peer signaling and discovery for WebRTC-based meshes, partial meshes, relay-assisted meshes, and hybrid decentralized overlays.
-**Revision:** 2 (additive; envelopes remain `psp_version` `"1.0"`). Revision 2 adds mesh-carried signaling (19.4), relay on demand (19.5), anchors (19.6), peer channel control frames (19.7) and relay federation (19.8). A peer that implements none of them remains conforming.
+**Revision:** 3 (additive; envelopes remain `psp_version` `"1.0"`). Revision 2 added mesh-carried signaling (19.4), relay on demand (19.5), anchors (19.6), peer channel control frames (19.7) and relay federation (19.8). Revision 3 adds:
+
+* relay identity (5.4);
+* relay hints in `peer_list` (9.4);
+* the link bye frame (19.7);
+* relay records and pointers (19.8);
+* tunnels for relays behind NAT (19.9);
+* punched relay connections (19.10);
+* links between relays (19.11);
+* relay selection by peers (19.12).
+
+It also lowers the relay-on-demand defaults to one neighbour and one anchor (19.5, 19.6, 26). A peer or relay that implements none of these remains conforming.
 
 ## 1. Purpose
 
@@ -129,6 +140,14 @@ Examples:
 ### 5.3 Instance ID
 
 A peer process SHOULD generate an `instance_id` each time it starts. This distinguishes restarts from a long-lived stable identity.
+
+---
+
+### 5.4 Relay ID
+
+A relay that federates (19.8) holds a long-lived signing key. Its **relay ID** is the SHA-256 of that key, as 64 lowercase hex characters: the same ID in the relays' overlay, in its tunnel address (19.9), in the relay list it serves, and as the `from` of every envelope the relay itself originates (`peer_list`, `redirect`, `error`, `ack`). A relay without a signing key uses the SHA-256 of the domain it is served on.
+
+A relay ID is never derived from a hostname a relay shares with another relay. In particular, a relay reached through a tunnel home is not the home: two relays can only share an ID by sharing a key.
 
 ---
 
@@ -375,6 +394,13 @@ Returns candidate peers.
   }
 }
 ```
+
+A relay that federates MAY add to each peer it learned from another relay:
+
+* `relay_url`: the address of the relay that holds that peer;
+* `relay_node_id`: that relay's ID (5.4). For a relay behind NAT the URL is its tunnel home's, the ID its own.
+
+A peer MUST NOT treat these as an instruction; they are hints the relay itself uses to route negotiation messages for that peer (19.8).
 
 ---
 
@@ -1002,7 +1028,7 @@ A **neighbour** is a peer with an open data channel whose liveness has been conf
 
 A peer SHOULD release when all of these have held continuously for the settle period (default 30 s):
 
-1. it has at least `min_mesh_peers` neighbours (default 2);
+1. it has at least `min_mesh_peers` neighbours (default 1: a peer that can reach a neighbour over a data channel is not cut off from the mesh);
 2. it is not an anchor (19.6);
 3. no negotiation is in flight, because the answer to one may still be coming by relay.
 
@@ -1029,7 +1055,7 @@ A host that enforces a relay acknowledgement deadline MUST suspend it while the 
 
 If every peer in a room released its relay connection, a newcomer would find nobody. A few peers therefore stay registered: the **anchors**.
 
-* The anchors of a room are the `anchors` peers (default 3) with the smallest distance to the room.
+* The anchors of a room are the `anchors` peers (default 1) with the smallest distance to the room. A room needs one way in. At three, every peer in a room of three or fewer was an anchor, so no peer in the small rooms that most need it ever released its relay. When the anchor leaves, the rest find themselves isolated and reopen their relays within one evaluation interval.
 * The distance of a peer is `SHA-256(peer_id) XOR SHA-256(network + ":" + session_id)`, each digest read as a 256-bit unsigned big-endian integer and each input encoded as UTF-8. Ties are broken by lexicographic order of `peer_id`.
 * A peer computes the anchors among itself, its neighbours, and the peers its neighbours have vouched for (19.7). It is an anchor when it is among them. Peers with the same view reach the same answer, and a peer closer to the room than the others it knows of learns of it through its neighbours.
 * A peer that is not an anchor but has fewer than `min_mesh_peers` neighbours keeps its relay connection, so a small or damaged mesh is never left without one.
@@ -1052,11 +1078,60 @@ Defined frames:
 * A sender SHOULD send the frame when its set changes, and otherwise at least every half of the gossip TTL (default 20 s).
 * A receiver keeps the set for the gossip TTL and then discards it. It MUST accept at most 16 ids of at most 256 characters each, and MUST NOT forward the frame.
 
+* A **link bye**: a peer closing a link SHOULD first tell the other end on that link's own channel, and close the transport only after the frame has had time to flush (default 250 ms). A `bye` sent only through the relay can be lost along with the link it describes, which leaves the other end holding a half-closed link that swallows frames. The frame is `{ "type": "~bye", "reason": "..." }`. Implementations SHOULD also accept `{ "type": "freertc-bye", "reason": "..." }`, the name freertc sends. A receiver closes the link and reports it closed. A peer SHOULD also send `bye` through the relay as before.
+
 Liveness of an edge is the peers' own concern and is confirmed on the channel, for example by `ping` and `pong` sent as data channel messages, not through a relay.
 
 ### 19.8 Relay Federation
 
 No relay is required to be a hub. A relay MAY be configured with one or more seed relays; a relay joins the overlay through one seed at a time and learns the others from it, so any relay can be a seed. A relay MAY forward an addressed message toward the relay that holds the addressee. A relay that does not hold the addressee MUST say so with an `error` whose code is `unknown_peer` rather than drop the message silently, and a relay MUST NOT forward a message again once it has been forwarded, so that a forwarded message cannot loop.
+
+**Rooms, not peers.** A relay that serves a room publishes that it does, keyed by `SHA-256(["freertc-kad", 1, "scope", network, session_id])` as canonical JSON. Which relay holds one particular peer is never published. A relay that must reach a peer asks the relays serving the peer's room, and only the relay that holds the peer delivers.
+
+**Relay records.** A relay describes itself in a record signed with its key, which includes:
+
+* `node_id`: its relay ID (5.4);
+* `url`: its signaling address;
+* `relay_kind`: `cloud` (the default; a relay whose requests are metered) or `local` (a relay on someone's own machine);
+* `reach`: the ways to reach it, most preferred first, each `{ "via": "punch" | "tunnel" | "direct", "url": "..." }`. A relay MAY only point at its own tunnel (19.9).
+
+The record's signature covers every field, so a changed kind or pointer fails verification. Relays MUST ignore fields they do not understand rather than reject the record. A record is a **pointer**: a relay that holds another relay's record can tell a peer how to reach that relay without carrying its traffic.
+
+**Private addresses.** A relay that federates publicly MUST NOT publish, store or pass on a record whose address is loopback or private (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, `localhost`, `*.local`, IPv6 loopback and unique-local). Only a relay configured as part of a private network accepts them.
+
+### 19.9 Tunnels
+
+A relay behind NAT has no public address. It MAY take one through a **tunnel home**, a public relay:
+
+1. It opens one WebSocket outward to `wss://<home>/t/<relay id>/connect`.
+2. It proves it holds the key its relay ID comes from: the home sends a fresh nonce, and the relay signs it together with the home's host.
+3. From then on its address is `wss://<home>/t/<relay id>/ws`. The home carries every HTTP request and WebSocket sent to `/t/<relay id>/...` down the tunnel, unmodified, and returns the relay's answers.
+
+A home MUST refuse a tunnel whose relay cannot prove its key. It MUST NOT carry traffic for a relay ID other than the one that opened the tunnel. A home SHOULD let an idle tunnel cost nothing, for example by answering the relay's keepalive without waking anything else.
+
+### 19.10 Punched Relay Connections
+
+Every frame sent through a tunnel is work for the home. A peer that has WebRTC SHOULD therefore reach a relay behind NAT over a direct data channel, using the tunnel only to introduce it:
+
+1. The peer creates a peer connection and a data channel labelled `freertc-relay`, and waits for ICE gathering to complete, so that its offer holds every candidate.
+2. It posts `{ "sdp": "<offer>" }` to `https://<home>/t/<relay id>/api/v1/punch/offer` as `text/plain`. That makes it a simple request, so no CORS preflight is needed and the home sees one request.
+3. The relay answers `{ "ok": true, "sdp": "<answer>" }`, also with every candidate, or `{ "ok": false, "error": "..." }`.
+4. Once the data channel opens, it carries PSP envelopes exactly as a WebSocket to the relay would, one envelope per message.
+
+If the channel does not open within a bounded time (default 12 s), or the relay refuses, the peer MUST fall back to the tunnel address and SHOULD NOT try to punch that relay again for a while (default 10 minutes). This binding uses no TURN server; two peers behind symmetric NATs fall back to the tunnel.
+
+### 19.11 Links Between Relays
+
+Two relays behind NAT reach each other through their tunnel homes, so their federation calls would cross a public relay twice. Such relays MAY keep **links**: a punched data channel (as in 19.10, labelled `freertc-federation`), or a WebSocket to the other relay's LAN address at `/api/v1/link`.
+
+* **Before anything else crosses:** each end sends `{ "t": "challenge", "nonce" }`. The other end answers `{ "t": "hello", "record", "signature" }`: its signed relay record (19.8) and a signature over that nonce. An end that has not proved its key is closed. A challenge MAY be repeated until it is answered.
+* **Requests:** they then cross in both directions as `{ "t": "req", "id", "method", "path", "headers", "body" }` and are answered `{ "t": "res", "id", "status", "headers", "body" }`, with bodies in base64.
+* **One link per pair:** only the relay with the lower relay ID dials.
+* **LAN discovery:** relays on one network MAY find each other with a UDP broadcast beacon `{ "freertc": "lan", "v": 1, "node_id", "port" }`. A beacon is only a hint, because the link is authenticated. Loopback MUST NOT be used, and nothing learned from a beacon may be published (19.8).
+
+### 19.12 Relay Selection
+
+A peer that may use any of several federated relays SHOULD choose by relay ID, not by hostname. The relay list a relay serves (`GET /api/v1/relays`) gives each relay's `node_id`, `relay_kind` and `reach`. A RECOMMENDED policy is to choose among the room's relays, those closest to the room key of 19.8, and to prefer a healthy `local` relay over a `cloud` one. Within that, prefer the relay with the best measured join time, failure rate and load, and do not switch from the relay used last unless another is clearly better.
 
 ---
 
@@ -1299,9 +1374,12 @@ A peer that releases its relay connection (19.5) MUST also:
 * retry base delay: `1000`
 * max retries: `5`
 * peer discovery limit default: `16`
-* relay on demand: `min_mesh_peers` `2`, `anchors` `3`, settle `30000`, linger `60000`
+* relay on demand: `min_mesh_peers` `1`, `anchors` `1`, settle `30000`, linger `60000`
 * anchor evaluation interval: `5000`
 * anchor gossip TTL: `20000`
+* signaling keepalive: `ping` every `25000`, give up on one unanswered for `60000`
+* link bye flush before closing: `250`
+* punched relay connection: open timeout `12000`, retry a refusing relay after `600000`
 
 ---
 
